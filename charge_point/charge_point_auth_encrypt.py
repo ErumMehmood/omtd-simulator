@@ -2,17 +2,14 @@ import asyncio
 import logging
 import datetime
 import uuid
+import ssl
+import hashlib  # NEW
 
-try:
-    import websockets
-except ModuleNotFoundError:
-    print("Please install the 'websockets' package: pip install websockets")
-    import sys
-    sys.exit(1)
+import websockets
 
 from omtd.v1 import ChargePoint as cp
 from omtd.v1 import call
-from omtd.v1.enums import ChargingStateEnumType, ReasonEnumType, TransactionEventEnumType, TriggerReasonEnumType
+from omtd.v1.enums import TransactionEventEnumType, TriggerReasonEnumType
 from omtd.v1.datatypes import EVSEType, IdTokenType, MeterValueType, SampledValueType, TransactionType
 
 logging.basicConfig(level=logging.INFO)
@@ -50,14 +47,11 @@ class ChargePoint(cp):
                 )
             ],
             evse=EVSEType(id=1, connector_id=1),
-            id_token=IdTokenType(id_token="user123", type="Central"),
-            #charging_state=ChargingStateEnumType.charging
+            id_token=IdTokenType(
+                id_token=self._hash_token("user123"),  # send hashed token
+                type="Central"
+            )
         )
-        '''
-        while True:
-            await self.call(request)
-            await asyncio.sleep(5)
-        '''
         await self.call(request)
 
     async def send_transaction_event_ended(self, transaction_id):
@@ -74,33 +68,30 @@ class ChargePoint(cp):
                 )
             ],
             evse=EVSEType(id=1, connector_id=1),
-            id_token=IdTokenType(id_token="user123", type="Central"),
-            #charging_state=ChargingStateEnumType.stopped,
-            #reason=ReasonEnumType.ev_disconnected
-        )
-        await self.call(request)
-        #await asyncio.sleep(6)
-        #await self.call(request)
-        
-    async def send_authorize_request(self, id_token_str):
-        #print("id_token_str", id_token_str)
-        
-        request = call.Authorize(
             id_token=IdTokenType(
-                id_token=id_token_str,
+                id_token=self._hash_token("user123"),
                 type="Central"
             )
         )
+        await self.call(request)
+
+    async def send_authorize_request(self, id_token_str):
+        hashed_token = self._hash_token(id_token_str)
+        request = call.Authorize(
+            id_token=IdTokenType(id_token=hashed_token, type="Central")
+        )
         response = await self.call(request)
-        #print("🚦 Authorize response:", response)
 
         if response.id_token_info['status'] == 'Accepted':
-            print("✅ EV successfully authorized!")
+            print("✅ EV successfully authorized (secure)!")
             return True
         else:
             print("❌ EV authorization failed.")
             return False
 
+    def _hash_token(self, token: str) -> str:
+        #return hashlib.sha256(token.encode()).hexdigest()
+        return hashlib.md5(token.encode()).hexdigest()  # 32 chars
 
 async def safe_start(cp):
     try:
@@ -110,40 +101,29 @@ async def safe_start(cp):
 
 
 async def main():
+    ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ssl_context.load_verify_locations("server-cert.pem")
+
     async with websockets.connect(
-        "ws://localhost:9000/CP_1", subprotocols=["ocpp2.0.1"]
+        "wss://localhost:9000/CP_1",
+        subprotocols=["ocpp2.0.1"],
+        ssl=ssl_context
     ) as ws:
         charge_point = ChargePoint("CP_1", ws)
 
         transaction_id = str(uuid.uuid4())
-        id_token_str = "user123"  # EV's RFID or unique identifier
-        '''
-        await asyncio.gather(
-            charge_point.start(),
-            charge_point.send_boot_notification()           
-        )
-        '''
-        #print("hello")
+        id_token_str = "user123"
+
         
-        #await charge_point.start()
-        #await charge_point.send_boot_notification()
-        # Start listener in background so it doesn't block the rest
-        #asyncio.create_task(charge_point.start())
-        # instead of asyncio.create_task(charge_point.start())
         asyncio.create_task(safe_start(charge_point))
         asyncio.create_task(charge_point.send_boot_notification())
-        
-        # 🔐 Authenticate the EV before charging
+
         authorized = await charge_point.send_authorize_request(id_token_str)
-        print("Authorized:", authorized)
         if authorized:
             await charge_point.send_transaction_event_started(transaction_id)
             await asyncio.sleep(5)
             await charge_point.send_transaction_event_ended(transaction_id)
-        else:
-            print("Charging denied. Authorization failed.")
-        
-        
+
 
 if __name__ == "__main__":
     asyncio.run(main())
